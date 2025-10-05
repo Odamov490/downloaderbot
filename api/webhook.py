@@ -1,192 +1,80 @@
-from http.server import BaseHTTPRequestHandler
-import os, json, re
-from urllib import request as urlrequest
-from yt_dlp import YoutubeDL
+import re
 
-# === Environment ===
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-TG_API = f"https://api.telegram.org/bot{BOT_TOKEN}" if BOT_TOKEN else None
+YOUTUBE_ID_RE = re.compile(r'(?:v=|/shorts/|youtu\.be/)([A-Za-z0-9_-]{11})')
 
-# === Kiritilgan matndan URL izlash ===
-URL_RE = re.compile(r"https?://\S+")
+INVIDIOUS_HOSTS = [
+    "yewtu.be",           # eng barqarorlaridan biri
+    "vid.puffyan.us",
+    "invidious.snopyta.org",
+]
+PIPED_HOSTS = [
+    "piped.video",        # Piped ham ko‘pincha yaxshi ishlaydi
+    "piped.video-proxy.lunar.icu"
+]
 
-# === Telegram helperlari ===
-def tg_post(method: str, payload: dict):
-    """POST JSON to Telegram Bot API."""
-    data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-    req = urlrequest.Request(
-        f"{TG_API}/{method}",
-        data=data,
-        headers={"Content-Type": "application/json; charset=utf-8"},
-    )
-    with urlrequest.urlopen(req, timeout=20) as r:
-        return json.loads(r.read().decode("utf-8"))
-
-def send_text(chat_id: int, text: str):
-    if TG_API:
-        try:
-            tg_post("sendMessage", {"chat_id": chat_id, "text": text})
-        except Exception as e:
-            print("send_text error:", e)
-
-def send_video_by_url(chat_id: int, url: str, caption: str = ""):
-    try:
-        return tg_post("sendVideo", {"chat_id": chat_id, "video": url, "caption": caption})
-    except Exception as e:
-        print("send_video_by_url error:", e)
-        return {"ok": False, "error": str(e)}
-
-def send_audio_by_url(chat_id: int, url: str, caption: str = ""):
-    try:
-        return tg_post("sendAudio", {"chat_id": chat_id, "audio": url, "caption": caption})
-    except Exception as e:
-        print("send_audio_by_url error:", e)
-        return {"ok": False, "error": str(e)}
-
-def send_document_by_url(chat_id: int, url: str, caption: str = ""):
-    try:
-        return tg_post("sendDocument", {"chat_id": chat_id, "document": url, "caption": caption})
-    except Exception as e:
-        print("send_document_by_url error:", e)
-        return {"ok": False, "error": str(e)}
-
-# === yt-dlp orqali to‘g‘ridan-to‘g‘ri media URL chiqarish (download=False) ===
-def extract_direct_url(src_url: str, quality: str = "best", audio_only: bool = False):
-    """
-    quality: 'best' | '720' | '360'
-    audio_only: True bo‘lsa faqat audio URL qaytaradi
-    """
-    if audio_only:
-        ydl_format = "bestaudio/best"
-    else:
-        if quality == "720":
-            ydl_format = "bestvideo[height<=720]+bestaudio/best[height<=720]/best"
-        elif quality == "360":
-            ydl_format = "bestvideo[height<=360]+bestaudio/best[height<=360]/best"
-        else:
-            ydl_format = "best[ext=mp4]/best"
-
-    opts = {
-        "quiet": True,
-        "noprogress": True,
-        "skip_download": True,
-        "noplaylist": True,
-        "format": ydl_format,
-    }
-
+def _try_ydl(url, yfmt, cookiefile=None, client=None):
+    opts = _base_ydl_opts(yfmt, cookiefile)
+    if client:
+        opts.setdefault("extractor_args", {}).setdefault("youtube", {})["player_client"] = client
     with YoutubeDL(opts) as ydl:
-        info = ydl.extract_info(src_url, download=False)
+        info = ydl.extract_info(url, download=False)
         title = info.get("title") or "video"
-        # Ba’zi saytlarda tanlangan format info["url"] da bo‘ladi
         direct = info.get("url")
         if not direct:
             for f in reversed(info.get("formats") or []):
                 if f.get("url"):
-                    direct = f["url"]
-                    break
+                    direct = f["url"]; break
     return direct, title
 
-# === Foydalanuvchi buyruqlarini tushunish ===
-def parse_mode(text: str):
-    """
-    Matndan sifat/audio rejimini aniqlaydi.
-    Misollar:
-      "https://... 720" -> ("video", "720")
-      "https://... audio" -> ("audio", None)
-      "/video360 https://..." -> ("video", "360")
-    """
-    t = (text or "").lower()
-    if "audio" in t or "/audio" in t:
-        return ("audio", None)
-    if "720" in t or "/video720" in t or "/v720" in t:
-        return ("video", "720")
-    if "360" in t or "/video360" in t or "/v360" in t:
-        return ("video", "360")
-    # default
-    return ("video", "best")
+def extract_direct_url(src_url: str, quality: str = "best", audio_only: bool = False):
+    # format tanlash
+    if audio_only:
+        yfmt = "bestaudio/best"
+    else:
+        yfmt = {"720": "bestvideo[height<=720]+bestaudio/best[height<=720]/best",
+                "360": "bestvideo[height<=360]+bestaudio/best[height<=360]/best"}.get(quality, "best[ext=mp4]/best")
 
-HELP_TEXT = (
-    "👋 *Video Downloader bot*\n\n"
-    "Menga *public* video havolasini yuboring.\n"
-    "✅ Standart: eng yaxshi sifatdagi video yuboriladi.\n\n"
-    "🎛 *Rejimlar:*\n"
-    "• Video 720p: havoladan keyin `720` yozing yoki /video720\n"
-    "• Video 360p: havoladan keyin `360` yozing yoki /video360\n"
-    "• Faqat audio: havoladan keyin `audio` yozing yoki /audio\n\n"
-    "Misollar:\n"
-    "`https://youtu.be/... 720`\n"
-    "`https://tiktok.com/... audio`\n"
-    "`/video360 https://instagram.com/reel/...`\n\n"
-    "_Eslatma: private/login talab qiladigan linklar ishlamaydi._"
-)
-
-class handler(BaseHTTPRequestHandler):
-    def do_POST(self):
-        # Vercel uchun tezda 200 qaytaramiz (serverless requestni bloklamaslik uchun)
+    # 1) Asl URL (YouTube bo‘lsa bir necha client bilan)
+    is_yt = "youtube.com" in src_url or "youtu.be" in src_url
+    last_err = None
+    if is_yt:
+        for client in [["android"], ["web"], ["ios"], ["mweb"]]:
+            try:
+                d, t = _try_ydl(src_url, yfmt, cookiefile=None, client=client)
+                if d: return d, t
+            except Exception as e:
+                last_err = e
+                print("yt try failed", client, e)
+    else:
         try:
-            length = int(self.headers.get("content-length", "0"))
-            body = self.rfile.read(length) if length > 0 else b"{}"
-            update = json.loads(body.decode("utf-8"))
-        except Exception:
-            self.send_response(200); self.end_headers(); return
-
-        # Javobni darhol yopamiz
-        self.send_response(200)
-        self.end_headers()
-
-        if not BOT_TOKEN:
-            print("ERROR: BOT_TOKEN env yo‘q.")
-            return
-
-        msg = update.get("message") or update.get("edited_message") or {}
-        chat_id = (msg.get("chat") or {}).get("id")
-        text = msg.get("text") or msg.get("caption") or ""
-
-        if not chat_id:
-            return
-
-        # Slash komandalar
-        if text.startswith("/start"):
-            send_text(chat_id, "Salom! 🖐️ Menga video havolasini yuboring.\n\n" + HELP_TEXT)
-            return
-        if text.startswith("/help"):
-            send_text(chat_id, HELP_TEXT)
-            return
-        if text.startswith("/about"):
-            send_text(chat_id, "Bot: Vercel webhook + yt-dlp (URL orqali jo‘natish). Muallif: siz 😎")
-            return
-
-        # Link qidiramiz
-        m = URL_RE.search(text)
-        if not m:
-            # Foydalanuvchiga yo‘l-yo‘riq
-            send_text(chat_id, "🎯 Havola yuboring.\n\n" + HELP_TEXT)
-            return
-
-        src_url = m.group(0)
-        mode, q = parse_mode(text)
-
-        send_text(chat_id, "⏬ Link qabul qilindi, tayyorlayapman…")
-
-        try:
-            if mode == "audio":
-                direct, title = extract_direct_url(src_url, audio_only=True)
-                if not direct:
-                    send_text(chat_id, "❌ Audio URL topilmadi.")
-                    return
-                r = send_audio_by_url(chat_id, direct, caption=title)
-                if not (isinstance(r, dict) and r.get("ok")):
-                    send_document_by_url(chat_id, direct, caption=title)
-            else:
-                direct, title = extract_direct_url(src_url, quality=q or "best", audio_only=False)
-                if not direct:
-                    send_text(chat_id, "❌ Video URL topilmadi.")
-                    return
-                r = send_video_by_url(chat_id, direct, caption=title)
-                if not (isinstance(r, dict) and r.get("ok")):
-                    # Ba’zi hollarda Telegram video URL’ni rad etadi — hujjat sifatida urinib ko‘ramiz
-                    send_document_by_url(chat_id, direct, caption=title)
-
+            return _try_ydl(src_url, yfmt, cookiefile=None)
         except Exception as e:
-            print("Process error:", e)
-            send_text(chat_id, f"❌ Yuklab bo‘lmadi: {e}")
+            last_err = e
+            print("extract error", e)
+
+    # 2) Fallback — Invidious
+    if is_yt:
+        m = YOUTUBE_ID_RE.search(src_url)
+        vid = m.group(1) if m else None
+        if vid:
+            for host in INVIDIOUS_HOSTS:
+                inv_url = f"https://{host}/watch?v={vid}"
+                try:
+                    d, t = _try_ydl(inv_url, yfmt, cookiefile=None)
+                    if d: return d, t
+                except Exception as e:
+                    print("invidious failed", host, e)
+
+            # 3) Fallback — Piped
+            for host in PIPED_HOSTS:
+                piped_url = f"https://{host}/watch?v={vid}"
+                try:
+                    d, t = _try_ydl(piped_url, yfmt, cookiefile=None)
+                    if d: return d, t
+                except Exception as e:
+                    print("piped failed", host, e)
+
+    # Agar hech biri bo‘lmadi:
+    if last_err:
+        raise last_err
+    raise Exception("Direct URL topilmadi (prob: login/region/age limit)")
